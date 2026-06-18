@@ -8,10 +8,10 @@ where a configurable fraction of them all hold the same position.
 
 import asyncio
 import argparse
+import random
 import sys
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Optional
 
 try:
     import aiohttp
@@ -30,8 +30,59 @@ except ImportError:
 BASE_URL = "https://data-api.polymarket.com"
 POLYMARKET_URL = "https://polymarket.com/event"
 
-# Stay well within the 150 req/10s limit
-MAX_CONCURRENT_FETCHES = 10
+# Target 10 req/s — comfortably under the API limit of 150 req/10s
+_RATE = 10.0
+_MAX_RETRIES = 6
+
+
+class RateLimiter:
+    """Token bucket: drains at `rate` tokens/sec, refills at the same rate."""
+
+    def __init__(self, rate: float = _RATE) -> None:
+        self._rate = rate
+        self._tokens = rate
+        self._updated_at: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._updated_at
+            self._tokens = min(self._rate, self._tokens + elapsed * self._rate)
+            self._updated_at = now
+            if self._tokens < 1:
+                wait = (1 - self._tokens) / self._rate
+                await asyncio.sleep(wait)
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
+async def _get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict,
+    limiter: RateLimiter,
+) -> object:
+    """Rate-limited GET with exponential-backoff retry on 429."""
+    for attempt in range(_MAX_RETRIES):
+        await limiter.acquire()
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    wait = (2 ** attempt) + random.random()
+                    print(f"\n  Rate limited — waiting {wait:.1f}s...", end="", flush=True)
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status == 404:
+                    return None
+                resp.raise_for_status()
+                return await resp.json()
+        except aiohttp.ClientConnectionError:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    return None
 
 
 @dataclass
@@ -80,24 +131,20 @@ async def fetch_leaderboard(
     session: aiohttp.ClientSession,
     top_n: int,
     time_period: str,
+    limiter: RateLimiter,
 ) -> list:
     """Fetch top N traders by PnL, paginating as needed (API max is 50/page)."""
     traders = []
-    page_size = 50  # API maximum
+    page_size = 50
 
     while len(traders) < top_n:
-        need = top_n - len(traders)
         params = {
             "orderBy": "PNL",
             "timePeriod": time_period,
-            "limit": min(page_size, need),
+            "limit": min(page_size, top_n - len(traders)),
             "offset": len(traders),
         }
-
-        async with session.get(f"{BASE_URL}/v1/leaderboard", params=params) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-
+        data = await _get_json(session, f"{BASE_URL}/v1/leaderboard", params, limiter)
         if not data:
             break
 
@@ -113,7 +160,7 @@ async def fetch_leaderboard(
             ))
 
         if len(data) < params["limit"]:
-            break  # No more pages
+            break
 
     return traders[:top_n]
 
@@ -122,63 +169,58 @@ async def fetch_positions(
     session: aiohttp.ClientSession,
     trader: Trader,
     min_value: float,
-    semaphore: asyncio.Semaphore,
+    limiter: RateLimiter,
 ) -> tuple:
     """Fetch all open positions for a single trader above the value threshold."""
-    async with semaphore:
-        all_positions = []
-        offset = 0
-        page_size = 500  # API max
+    all_positions = []
+    offset = 0
+    page_size = 500
 
-        while True:
-            params = {
-                "user": trader.proxy_wallet,
-                "sizeThreshold": 1,
-                "limit": page_size,
-                "offset": offset,
-                "sortBy": "CURRENT",
-                "sortDirection": "DESC",
-            }
+    while True:
+        params = {
+            "user": trader.proxy_wallet,
+            "sizeThreshold": 1,
+            "limit": page_size,
+            "offset": offset,
+            "sortBy": "CURRENT",
+            "sortDirection": "DESC",
+        }
 
-            try:
-                async with session.get(f"{BASE_URL}/positions", params=params) as resp:
-                    if resp.status == 404:
-                        break
-                    resp.raise_for_status()
-                    data = await resp.json()
-            except Exception as exc:
-                print(f"  Warning: failed to fetch positions for {trader.username}: {exc}",
-                      file=sys.stderr)
-                break
+        try:
+            data = await _get_json(session, f"{BASE_URL}/positions", params, limiter)
+        except Exception as exc:
+            print(f"\n  Warning: failed to fetch positions for {trader.username}: {exc}",
+                  file=sys.stderr)
+            break
 
-            if not data:
-                break
+        if not data:
+            break
 
-            for p in data:
-                current_value = p.get("currentValue") or 0
-                if current_value < min_value:
-                    continue
-                condition_id = p.get("conditionId", "")
-                if not condition_id:
-                    continue
-                all_positions.append(Position(
-                    condition_id=condition_id,
-                    title=p.get("title", "Unknown market"),
-                    outcome=p.get("outcome", ""),
-                    outcome_index=p.get("outcomeIndex", 0),
-                    size=p.get("size") or 0,
-                    cur_price=p.get("curPrice") or 0,
-                    current_value=current_value,
-                    cash_pnl=p.get("cashPnl") or 0,
-                    slug=p.get("slug", ""),
-                    end_date=p.get("endDate", ""),
-                ))
+        for p in data:
+            current_value = p.get("currentValue") or 0
+            if current_value < min_value:
+                continue
+            condition_id = p.get("conditionId", "")
+            if not condition_id:
+                continue
+            all_positions.append(Position(
+                condition_id=condition_id,
+                title=p.get("title", "Unknown market"),
+                outcome=p.get("outcome", ""),
+                outcome_index=p.get("outcomeIndex", 0),
+                size=p.get("size") or 0,
+                cur_price=p.get("curPrice") or 0,
+                current_value=current_value,
+                cash_pnl=p.get("cashPnl") or 0,
+                slug=p.get("slug", ""),
+                end_date=p.get("endDate", ""),
+            ))
 
-            if len(data) < page_size:
-                break  # Last page
-            offset += page_size
+        if len(data) < page_size:
+            break
+        offset += page_size
 
-        return trader, all_positions
+    return trader, all_positions
 
 
 def find_consensus(
@@ -335,13 +377,13 @@ async def main(args: argparse.Namespace) -> None:
     print(f"Fetching top {args.top_n} traders by PnL "
           f"(time period: {args.time_period})...", flush=True)
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+    limiter = RateLimiter(rate=_RATE)
     headers = {"User-Agent": "polymarket-consensus/1.0"}
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=60)
 
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         try:
-            traders = await fetch_leaderboard(session, args.top_n, args.time_period)
+            traders = await fetch_leaderboard(session, args.top_n, args.time_period, limiter)
         except aiohttp.ClientResponseError as exc:
             print(f"Error fetching leaderboard: HTTP {exc.status} – {exc.message}")
             sys.exit(1)
@@ -351,13 +393,22 @@ async def main(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         actual_n = len(traders)
-        print(f"Got {actual_n} traders. Fetching positions concurrently...", flush=True)
+        print(f"Got {actual_n} traders. Fetching positions "
+              f"(~{actual_n / _RATE:.0f}s at {_RATE:.0f} req/s)...", flush=True)
 
-        tasks = [
-            fetch_positions(session, trader, args.min_value, semaphore)
-            for trader in traders
-        ]
-        trader_positions = await asyncio.gather(*tasks)
+        completed = 0
+
+        async def _fetch_with_progress(trader: Trader) -> tuple:
+            nonlocal completed
+            result = await fetch_positions(session, trader, args.min_value, limiter)
+            completed += 1
+            print(f"\r  {completed}/{actual_n} traders done", end="", flush=True)
+            return result
+
+        trader_positions = await asyncio.gather(
+            *[_fetch_with_progress(t) for t in traders]
+        )
+        print()  # newline after progress counter
 
     traders_with_data = sum(1 for _, p in trader_positions if p)
     total_positions = sum(len(p) for _, p in trader_positions)
