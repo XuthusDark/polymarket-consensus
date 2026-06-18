@@ -328,7 +328,7 @@ def display_rich(results: list, top_n: int, active_traders: int, threshold: floa
             str(i),
             title_cell,
             r.outcome[:5],
-            f"[{color}]{r.cur_price:.0%}[/{color}]",
+            f"[{color}]${r.cur_price:.2f}[/{color}]",
             f"[bold]{r.consensus_pct:.0%}[/bold]",
             f"{r.holder_count}/{r.top_n}",
             f"${r.avg_value:,.0f}",
@@ -367,7 +367,7 @@ def display_plain(results: list, top_n: int, active_traders: int, threshold: flo
     for i, r in enumerate(results, 1):
         url = f"{POLYMARKET_URL}/{r.slug}" if r.slug else "N/A"
         print(f"\n{i}. {r.title}")
-        print(f"   Outcome:   {r.outcome}  |  Price: {r.cur_price:.0%}  |  "
+        print(f"   Outcome:   {r.outcome}  |  Price: ${r.cur_price:.2f}  |  "
               f"Consensus: {r.consensus_pct:.0%} ({r.holder_count}/{r.top_n})")
         print(f"   Holders:   {', '.join(r.holders[:6])}"
               + (f" +{len(r.holders)-6} more" if len(r.holders) > 6 else ""))
