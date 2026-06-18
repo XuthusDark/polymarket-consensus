@@ -58,17 +58,20 @@ class RateLimiter:
                 self._tokens -= 1.0
 
 
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+
 async def _get_json(
     session: aiohttp.ClientSession,
     url: str,
     params: dict,
     limiter: RateLimiter,
 ) -> object:
-    """Rate-limited GET with exponential-backoff retry on 429."""
+    """Rate-limited GET with exponential-backoff retry on 429 or connection errors."""
     for attempt in range(_MAX_RETRIES):
         await limiter.acquire()
         try:
-            async with session.get(url, params=params) as resp:
+            async with session.get(url, params=params, timeout=_REQUEST_TIMEOUT) as resp:
                 if resp.status == 429:
                     wait = (2 ** attempt) + random.random()
                     print(f"\n  Rate limited — waiting {wait:.1f}s...", flush=True)
@@ -78,7 +81,7 @@ async def _get_json(
                     return None
                 resp.raise_for_status()
                 return await resp.json()
-        except aiohttp.ClientConnectionError:
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
             if attempt == _MAX_RETRIES - 1:
                 raise
             await asyncio.sleep(2 ** attempt)
@@ -397,10 +400,21 @@ async def main(args: argparse.Namespace) -> None:
               f"(~{actual_n / _RATE:.0f}s at {_RATE:.0f} req/s)...", flush=True)
 
         completed = 0
+        _TRADER_TIMEOUT = 30.0
 
         async def _fetch_with_progress(trader: Trader) -> tuple:
             nonlocal completed
-            result = await fetch_positions(session, trader, args.min_value, limiter)
+            try:
+                result = await asyncio.wait_for(
+                    fetch_positions(session, trader, args.min_value, limiter),
+                    timeout=_TRADER_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                print(f"\n  Timed out fetching {trader.username} — skipping", flush=True)
+                result = (trader, [])
+            except Exception as exc:
+                print(f"\n  Error fetching {trader.username}: {exc} — skipping", flush=True)
+                result = (trader, [])
             completed += 1
             print(f"\r  {completed}/{actual_n} traders done", end="", flush=True)
             return result
