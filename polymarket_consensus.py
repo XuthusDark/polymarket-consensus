@@ -71,7 +71,7 @@ async def _get_json(
             async with session.get(url, params=params) as resp:
                 if resp.status == 429:
                     wait = (2 ** attempt) + random.random()
-                    print(f"\n  Rate limited — waiting {wait:.1f}s...", end="", flush=True)
+                    print(f"\n  Rate limited — waiting {wait:.1f}s...", flush=True)
                     await asyncio.sleep(wait)
                     continue
                 if resp.status == 404:
