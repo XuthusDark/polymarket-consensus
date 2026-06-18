@@ -274,12 +274,14 @@ def display_rich(results: list, top_n: int, active_traders: int, threshold: floa
     table.add_column("Ends",      width=11)
 
     for i, r in enumerate(results, 1):
-        title = r.title if len(r.title) <= 50 else r.title[:49] + "…"
+        title_text = r.title if len(r.title) <= 50 else r.title[:49] + "…"
+        url = f"{POLYMARKET_URL}/{r.slug}" if r.slug else ""
+        title_cell = f"[link={url}]{title_text}[/link]" if url else title_text
         color = _price_color(r.cur_price)
 
         table.add_row(
             str(i),
-            title,
+            title_cell,
             r.outcome[:5],
             f"[{color}]{r.cur_price:.0%}[/{color}]",
             f"[bold]{r.consensus_pct:.0%}[/bold]",
@@ -290,15 +292,16 @@ def display_rich(results: list, top_n: int, active_traders: int, threshold: floa
 
     console.print(table)
 
-    console.print("\n[dim bold]Top 10 holder details:[/dim bold]")
+    console.print("\n[dim bold]Top 10 — holders & trade links:[/dim bold]")
     for i, r in enumerate(results[:10], 1):
         names = ", ".join(r.holders[:6])
         if len(r.holders) > 6:
             names += f" [dim]+{len(r.holders) - 6} more[/dim]"
-        url = f"{POLYMARKET_URL}/{r.slug}" if r.slug else "(no link)"
-        console.print(f"  [bold]{i}.[/bold] {r.title[:50]}")
-        console.print(f"     [cyan]{names}[/cyan]")
-        console.print(f"     [link={url}]{url}[/link]")
+        url = f"{POLYMARKET_URL}/{r.slug}" if r.slug else ""
+        console.print(f"  [bold]{i}.[/bold] {r.title[:60]}")
+        console.print(f"     Holders: [cyan]{names}[/cyan]")
+        if url:
+            console.print(f"     Trade:   [underline][link={url}]{url}[/link][/underline]")
 
 
 def display_plain(results: list, top_n: int, active_traders: int, threshold: float) -> None:
@@ -324,8 +327,8 @@ def display_plain(results: list, top_n: int, active_traders: int, threshold: flo
         print(f"   Holders:   {', '.join(r.holders[:6])}"
               + (f" +{len(r.holders)-6} more" if len(r.holders) > 6 else ""))
         print(f"   Avg value: ${r.avg_value:,.0f}  |  Avg P&L: ${r.avg_cash_pnl:,.0f}")
-        print(f"   Ends: {r.end_date[:10] if r.end_date else 'N/A'}")
-        print(f"   {url}")
+        print(f"   Ends:  {r.end_date[:10] if r.end_date else 'N/A'}")
+        print(f"   Trade: {url}")
 
 
 async def main(args: argparse.Namespace) -> None:
@@ -375,26 +378,46 @@ async def main(args: argparse.Namespace) -> None:
         display_plain(results, actual_n, active_traders, args.threshold)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Find Polymarket bets where the top N traders share the same position.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+HOW_TO_RUN = """
+Usage:
+  python polymarket_consensus.py --top-n N --threshold T [options]
+
+Required:
+  --top-n N        How many top traders (by PnL) to analyze  e.g. 25, 50
+  --threshold T    Fraction that must hold the same position  e.g. 0.3, 0.5
+
+Optional:
+  --time-period    DAY | WEEK | MONTH | ALL  (default: ALL)
+  --min-value USD  Ignore positions worth less than this in USD  (default: 10)
+  --active-only    Denominate against traders with open positions only
+                   (recommended — many top traders have no positions at any moment)
+  --plain          Plain text output, no color
+
 Examples:
-  python polymarket_consensus.py
-  python polymarket_consensus.py --top-n 50 --threshold 0.4
-  python polymarket_consensus.py --top-n 25 --threshold 0.6 --time-period WEEK
-  python polymarket_consensus.py --min-value 100 --plain
-""",
+  python polymarket_consensus.py --top-n 25 --threshold 0.3 --active-only
+  python polymarket_consensus.py --top-n 50 --threshold 0.4 --time-period WEEK
+  python polymarket_consensus.py --top-n 25 --threshold 0.5 --min-value 100 --plain
+"""
+
+
+class _HelpOnErrorParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        print(f"Error: {message}\n{HOW_TO_RUN}", file=sys.stderr)
+        sys.exit(2)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = _HelpOnErrorParser(
+        description="Find Polymarket bets where the top N traders share the same position.",
+        add_help=True,
     )
     parser.add_argument(
-        "--top-n", type=int, default=25, metavar="N",
-        help="Number of top traders to analyze (default: 25)",
+        "--top-n", type=int, required=True, metavar="N",
+        help="Number of top traders to analyze",
     )
     parser.add_argument(
-        "--threshold", type=float, default=0.5, metavar="FLOAT",
-        help="Min fraction of top-N traders holding the same position, "
-             "e.g. 0.5 = 50%% (default: 0.5)",
+        "--threshold", type=float, required=True, metavar="FLOAT",
+        help="Min fraction of top-N traders holding the same position, e.g. 0.3",
     )
     parser.add_argument(
         "--time-period", choices=["DAY", "WEEK", "MONTH", "ALL"], default="ALL",
@@ -407,8 +430,7 @@ Examples:
     )
     parser.add_argument(
         "--active-only", action="store_true",
-        help="Score consensus against traders who have any open position "
-             "rather than all top-N (raises effective consensus %%)",
+        help="Score consensus against traders who have any open position rather than all top-N",
     )
     parser.add_argument(
         "--plain", action="store_true",
