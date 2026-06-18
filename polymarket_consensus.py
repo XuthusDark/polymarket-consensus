@@ -215,7 +215,7 @@ async def fetch_positions(
                 cur_price=p.get("curPrice") or 0,
                 current_value=current_value,
                 cash_pnl=p.get("cashPnl") or 0,
-                slug=p.get("slug", ""),
+                slug=p.get("eventSlug") or p.get("slug", ""),
                 end_date=p.get("endDate", ""),
             ))
 
